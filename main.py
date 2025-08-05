@@ -457,7 +457,7 @@ async def mchk_command(message: Message):
 
 """
         except Exception as e:
-            results += f"❌ <b>Error with card:</b> <code>{card}</code>\n<b>Reason:</b> {str(e)}\n\n"
+            results += f"<code>{card}</code>\n<b>Reason:</b> {str(e)}\n\n"
         
         # Update progress
         progress_text = f"<b>🔍 Mass Check ⏳ ({i}/{len(extracted_cards)})</b>\n\n{results}"
