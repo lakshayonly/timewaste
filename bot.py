@@ -3,6 +3,8 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import Message
+from aiogram.filters import Command
 from main import router
 from keep_alive import keep_alive
 
@@ -13,10 +15,7 @@ logging.basicConfig(level=logging.INFO)
 # Bot token - Replace with your actual bot token
 BOT_TOKEN = "8371210517:AAH0kU5o5iGFv02L2l8GC-dd3Pq6DHfsqgM"
 
-async def main():
-    """Main function to start the bot"""
-    # Initialize Bot instance with default bot properties
-    @router.message(Command("start"))
+@router.message(Command("start"))
 async def start_command(message: Message):
     """Welcome message for new users"""
     user_first_name = message.from_user.first_name or "User"
@@ -83,6 +82,9 @@ async def cmds_command(message: Message):
 """
     await message.reply(cmds_text, parse_mode="HTML")
 
+async def main():
+    """Main function to start the bot"""
+    # Initialize Bot instance with default bot properties
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
